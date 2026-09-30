@@ -1,0 +1,414 @@
+#![allow(dead_code)]
+
+use crate::rgb;
+use parking_lot::Mutex;
+use rayon::prelude::*;
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Oklab {
+    pub l: f64,
+    pub a: f64,
+    pub b: f64,
+    pub d65_reference_l: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Oklch {
+    pub l: f64,
+    pub c: f64,
+    pub h: f64,
+    pub d65_reference_l: bool,
+}
+
+impl std::fmt::Display for Oklab {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Oklab({}, {}, {})", self.l, self.a, self.b)
+    }
+}
+impl std::fmt::Display for Oklch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Oklch({}, {}, {})", self.l, self.c, self.h)
+    }
+}
+
+impl Default for Oklab {
+    fn default() -> Self {
+        Self {
+            l: 0.0,
+            a: 0.0,
+            b: 0.0,
+            d65_reference_l: false,
+        }
+    }
+}
+impl Default for Oklch {
+    fn default() -> Self {
+        Self {
+            l: 0.0,
+            c: 0.0,
+            h: 0.0,
+            d65_reference_l: false,
+        }
+    }
+}
+
+impl Oklab {
+    pub const BLACK: Self = Self {
+        l: 0.0,
+        a: 0.0,
+        b: 0.0,
+        d65_reference_l: false,
+    };
+    pub const WHITE: Self = Self {
+        l: 1.0,
+        a: 0.0,
+        b: 0.0,
+        d65_reference_l: false,
+    };
+
+    /// Oklab does not have a white point reference by default, which is supposed to improve its lightness accuracy.
+    /// However, some applications do require a reference.
+    /// Ottoson developed this D65 lightness estimate for use in a color picker, which is supposed to show all colors under a single hue.
+    ///
+    /// I'm unsure whether I should use this when iterating through all sRGB colors, as Oklab is a transformation of sRGB, but sRGB has the D65 white point.
+    pub fn to_d65_white(self) -> Self {
+        if self.d65_reference_l {
+            return self;
+        }
+        Self {
+            l: 0.1
+                * (self
+                    .l
+                    .mul_add(36.3609 / 1.0609, -44.019 / 5.15)
+                    .mul_add(self.l, 1.0609)
+                    .sqrt()
+                    + self.l.mul_add(6.03 / 1.03, -1.03)),
+            d65_reference_l: true,
+            ..self
+        }
+    }
+    pub fn to_unreferenced_white(self) -> Self {
+        if self.d65_reference_l {
+            return Self {
+                l: self.l * (self.l.mul_add(51.5, 10.609) / self.l.mul_add(60.3, 1.809)),
+                d65_reference_l: false,
+                ..self
+            };
+        }
+        self
+    }
+
+    /// Perceived colorfulness against a gray background of the same lightness `self.l`
+    pub fn chroma(self) -> f64 {
+        self.a.hypot(self.b)
+    }
+    /// Hue angle, where `0.0` is on the positive `self.a` axis, representing redness.
+    pub fn hue(self) -> f64 {
+        self.b.atan2(self.a)
+    }
+    /// Officially undefined, the following is an interpretation of saturation.
+    ///
+    /// The common idea of saturation is chroma relative to lightness, so use `self.chroma() / self.l` if you think it's better.
+    ///
+    /// This interpretation is that saturation is chroma relative to "total perceived color sensation", or chroma and lightness combined in some way.
+    /// In this case, `self.delta_E_ab(Oklab::BLACK)` is considered to be chroma and lightness combined. However, `delta_E_Hyab` might be similar
+    /// Note that there isn't a definition for "relative lightness".
+    pub fn saturation(self) -> (f64, f64) {
+        (
+            self.chroma() / self.l,
+            self.chroma() / self.delta_E_ab(Self::BLACK),
+        )
+    }
+
+    /// Not to be confused with delta lowercase h, meaning difference in hue angles.
+    /// Use `self.hue() - other.hue()`, maybe with `.abs()`, instead.
+    ///
+    /// Signed hue contribution delta.
+    /// This is supposed to be the mean of the chroma cord lengths, if looking at the colors on a `self.a` vs `self.b` graph.
+    ///
+    /// I have no idea what you're supposed to do with this by itself, but it can be used in an alternative way to compute `delta_E_ab`.
+    #[allow(non_snake_case)]
+    pub fn delta_H(self, other: Self) -> f64 {
+        // DE94 formula
+        2.0 * (self.chroma() * other.chroma()).sqrt() * ((self.hue() - other.hue()) / 2.0).sin()
+    }
+
+    /// Euclidian distance formula.
+    ///
+    /// Highest `delta_E_ab` generated from pure black vs. pure white.
+    #[allow(non_snake_case)]
+    pub fn delta_E_ab(self, other: Self) -> f64 {
+        let l_difference = self.l - other.l;
+        let a_difference = self.a - other.a;
+        let b_difference = self.b - other.b;
+        (l_difference.mul_add(
+            l_difference,
+            a_difference.mul_add(a_difference, b_difference.powi(2)),
+        ))
+        .sqrt()
+    }
+
+    /// Hybrid taxicab/Manhattan and Euclidian distances formula.
+    /// Shown to provide better agreement on colors with high difference values for CIELAB.
+    ///
+    /// Highest `delta_E_Hyab` generated from pure black vs. pure yellow.
+    // I wonder how delta_l + delta_c is compared to delta_l + sqrt(delta_a^2 + delta_b^2)
+    #[allow(non_snake_case)]
+    pub fn delta_E_Hyab(self, other: Self) -> f64 {
+        let l_difference = self.l - other.l;
+        let a_difference = self.a - other.a;
+        let b_difference = self.b - other.b;
+        l_difference.abs() + (a_difference.mul_add(a_difference, b_difference.powi(2))).sqrt()
+    }
+
+    pub fn to_oklch(self) -> Oklch {
+        Oklch {
+            l: self.l,
+            c: self.chroma(),
+            h: self.hue(),
+            d65_reference_l: self.d65_reference_l,
+        }
+    }
+
+    pub fn to_lrgb(self) -> rgb::lRGB {
+        let modified_l = if self.d65_reference_l {
+            self.to_unreferenced_white().l
+        } else {
+            self.l
+        };
+
+        let l_ = self
+            .a
+            .mul_add(0.396_337_777_4, self.b.mul_add(0.215_803_757_3, modified_l));
+        let m_ = self.a.mul_add(
+            -0.105_561_345_8,
+            self.b.mul_add(-0.063_854_172_8, modified_l),
+        );
+        let s_ = self
+            .a
+            .mul_add(-0.089_484_177_5, self.b.mul_add(-1.291_485_548, modified_l));
+        let l = l_.powi(3);
+        let m = m_.powi(3);
+        let s = s_.powi(3);
+        rgb::lRGB {
+            r: l.mul_add(
+                4.076_741_662_1,
+                m.mul_add(-3.307_711_591_3, 0.230_969_929_2 * s),
+            ),
+            g: l.mul_add(
+                -1.268_438_004_6,
+                m.mul_add(2.609_757_401_1, -0.341_319_396_5 * s),
+            ),
+            b: l.mul_add(
+                -0.004_196_086_3,
+                m.mul_add(-0.703_418_614_7, 1.707_614_701 * s),
+            ),
+        }
+    }
+
+    /// Plain RGB clipping.
+    /// You might want to use the other `to_srgb`_* functions.
+    pub fn to_srgb(self) -> rgb::sRGB {
+        self.to_lrgb().to_srgb()
+    }
+    /// Finds the sRGB value that is closest to the given Oklab. Very slow.
+    pub fn to_srgb_closest(self) -> rgb::sRGB {
+        // Early exit; should work
+        if (self.to_lrgb().min() >= -1e-6) && (self.to_lrgb().max() <= 1.0 + 1e-6) {
+            return self.to_srgb();
+        }
+
+        let saved_delta = Mutex::new(f64::MAX);
+        let saved_color = Mutex::new(rgb::sRGB { r: 0, g: 0, b: 0 });
+
+        // Despite parallelization, this is still rather slow
+        rgb::sRGB::all_colors()
+            .par_bridge()
+            .map(super::rgb::sRGB::to_oklab)
+            .for_each(|sample| {
+                let delta = self.delta_E_ab(sample);
+                {
+                    let mut locked_saved_delta = saved_delta.lock();
+                    let mut locked_saved_color = saved_color.lock();
+
+                    if delta < *locked_saved_delta {
+                        *locked_saved_delta = delta;
+                        drop(locked_saved_delta);
+                        *locked_saved_color = sample.to_srgb();
+                        drop(locked_saved_color);
+                    }
+                }
+            });
+
+        saved_color.into_inner()
+    }
+    /// Finds the sRGB value that is farthest away to the given Oklab.
+    pub fn to_srgb_contrast(self) -> rgb::sRGB {
+        let saved_delta = Mutex::new(f64::MIN);
+        let saved_color = Mutex::new(rgb::sRGB { r: 0, g: 0, b: 0 });
+
+        // All of these colors are known to be the 1-bit values
+        itertools::iproduct!([0, 255], [0, 255], [0, 255])
+            .map(|(r, g, b)| rgb::sRGB { r, g, b })
+            .par_bridge()
+            .map(super::rgb::sRGB::to_oklab)
+            .for_each(|sample| {
+                let delta = self.delta_E_Hyab(sample);
+                {
+                    let mut locked_saved_delta = saved_delta.lock();
+                    let mut locked_saved_color = saved_color.lock();
+
+                    if delta > *locked_saved_delta {
+                        *locked_saved_delta = delta;
+                        drop(locked_saved_delta);
+                        *locked_saved_color = sample.to_srgb();
+                        drop(locked_saved_color);
+                    }
+                }
+            });
+
+        saved_color.into_inner()
+    }
+}
+
+impl Oklch {
+    pub fn to_oklab(self) -> Oklab {
+        Oklab {
+            l: self.l,
+            a: self.c * self.h.cos(),
+            b: self.c * self.h.sin(),
+            d65_reference_l: self.d65_reference_l,
+        }
+    }
+
+    pub fn to_srgb(self) -> rgb::sRGB {
+        self.to_oklab().to_srgb()
+    }
+    pub fn to_srgb_closest(self) -> rgb::sRGB {
+        self.to_oklab().to_srgb_closest()
+    }
+}
+
+impl rgb::sRGB {
+    pub fn to_oklab(self) -> Oklab {
+        self.to_lrgb().to_oklab()
+    }
+    pub fn to_oklch(self) -> Oklch {
+        self.to_lrgb().to_oklab().to_oklch()
+    }
+}
+
+impl rgb::lRGB {
+    pub fn to_oklab(self) -> Oklab {
+        let l = self.r.mul_add(
+            0.412_221_470_8,
+            self.g.mul_add(0.536_332_536_3, 0.051_445_992_9 * self.b),
+        );
+        let m = self.r.mul_add(
+            0.211_903_498_2,
+            self.g.mul_add(0.680_699_545_1, 0.107_396_956_6 * self.b),
+        );
+        let s = self.r.mul_add(
+            0.088_302_461_9,
+            self.g.mul_add(0.281_718_837_6, 0.629_978_700_5 * self.b),
+        );
+        let l_ = l.cbrt();
+        let m_ = m.cbrt();
+        let s_ = s.cbrt();
+        Oklab {
+            l: l_.mul_add(
+                0.210_454_255_3,
+                m_.mul_add(0.793_617_785, -0.004_072_046_8 * s_),
+            ),
+            a: l_.mul_add(
+                1.977_998_495_1,
+                m_.mul_add(-2.428_592_205, 0.450_593_709_9 * s_),
+            ),
+            b: l_.mul_add(
+                0.025_904_037_1,
+                m_.mul_add(0.782_771_766_2, -0.808_675_766 * s_),
+            ),
+            d65_reference_l: false,
+        }
+    }
+    pub fn to_oklch(self) -> Oklch {
+        self.to_oklab().to_oklch()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::oklab;
+    use crate::rgb;
+
+    const DIFFERENCE: f64 = 1e-6;
+
+    #[test]
+    fn lrgb_to_oklab() {
+        let test = (rgb::lRGB {
+            r: 1.0,
+            g: 0.5,
+            b: 0.25,
+        })
+        .to_oklab()
+        .to_lrgb();
+        assert!((test.r - 1.0).abs() < DIFFERENCE);
+        assert!((test.g - 0.5).abs() < DIFFERENCE);
+        assert!((test.b - 0.25).abs() < DIFFERENCE);
+    }
+
+    #[test]
+    fn oklab_to_oklch() {
+        let test = (oklab::Oklab {
+            l: 0.5,
+            a: 0.25,
+            b: 0.125,
+            d65_reference_l: false,
+        })
+        .to_oklch()
+        .to_oklab();
+        assert!((test.l - 0.5).abs() < DIFFERENCE);
+        assert!((test.a - 0.25).abs() < DIFFERENCE);
+        assert!((test.b - 0.125).abs() < DIFFERENCE);
+        assert_eq!(test.d65_reference_l, false);
+    }
+
+    #[test]
+    fn unreferenced_white_to_d65_white() {
+        let test = (oklab::Oklab {
+            l: 0.5,
+            a: 0.25,
+            b: 0.125,
+            d65_reference_l: false,
+        })
+        .to_d65_white()
+        .to_unreferenced_white();
+        assert!((test.l - 0.5).abs() < DIFFERENCE);
+        assert!((test.a - 0.25).abs() < DIFFERENCE);
+        assert!((test.b - 0.125).abs() < DIFFERENCE);
+        assert_eq!(test.d65_reference_l, false);
+    }
+
+    #[test]
+    fn d65_white_to_lrgb() {
+        let test = oklab::Oklab {
+            l: 0.5,
+            a: 0.25,
+            b: 0.125,
+            d65_reference_l: false,
+        };
+        let test_2 = (oklab::Oklab {
+            l: 0.5,
+            a: 0.25,
+            b: 0.125,
+            d65_reference_l: false,
+        })
+        .to_d65_white()
+        .to_lrgb()
+        .to_oklab();
+        assert!((test.l - test_2.l).abs() < DIFFERENCE);
+        assert!((test.a - test_2.a).abs() < DIFFERENCE);
+        assert!((test.b - test_2.b).abs() < DIFFERENCE);
+        assert_eq!(test.d65_reference_l, test_2.d65_reference_l);
+    }
+}
